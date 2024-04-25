@@ -5,6 +5,9 @@
 # Last modified: 2024-04-24
 
 using SpecialFunctions
+include("gavg.jl")
+include("flatten.jl")
+include("layertrace.jl")
 
 # read in parameters
 vmodel::String = "./iasp91.smo"
@@ -29,9 +32,15 @@ nu = Float64[0.8, 0.8, 0.8, 0.8] # relative size of density perturbation (0.8 of
 eps = Float64[0.02, 0.02, 0.005, 0.005] # rms perturbation
 alen = Float64[4.0, 4.0, 8.0, 8.0] # scale length (km)
 
+nface::Int64 = 3 # number of interface depths (to follow) (max=6)
+depface = Float64[0, 2889, 5153.9] # iasp91 CMB & ICB
+
+np::Int64 = 10000 # number of ray parameters for tables (max=50000)
+
 # define variables
 nface0::Int64 = 6
 nlay0::Int64 = 655
+nray0::Int64 = 50000
 erad::Float64 = 6371.0
 
 z_s = zeros(Float64, nlay0)
@@ -55,155 +64,18 @@ npts::Int64 = 0
 
 scatprob = zeros(Float64, nface0, 2, 3)
 
-# calculate flat earth transformation
-function FLATTEN(z_s::Float64, vel_s::Float64)
-    erad:: Float64 = 6371.0
-    r::Float64 = erad - z_s
-    z_f::Float64 = - erad * log(r / erad)
-    vel_f::Float64 = vel_s * (erad / r)
-    return z_f, vel_f
-end
+vp = zeros(Float64, nface, 2)
+vs = zeros(Float64, nface, 2)
+den = zeros(Float64, nface, 2)
 
-# function EXPSATO computes (2.10) from Sato and Fehler
-#    Inputs:  eps  =  RMS velocity perturbation
-#             a    =  correlation distance
-#             m    =  wavenumber
-#    Returns: P(m) =  PSDF (Power Spectral Density Function)
-#
-function EXPSATO(eps::Float64, a::Float64, m::Float64)
-    kappa::Float64 = 0.5
-    gamma_k1::Float64 = gamma(kappa)
-    gamma_k2::Float64 = gamma(kappa + 0.5)
-    expon::Float64 = kappa + 1.5
-    expsato::Float64 = (8. * pi ^ 1.5 * eps ^ 2 * a ^ 3 * gamma_k2) / (
-        gamma_k1 * (1. + a ^ 2 * m ^ 2) ^ expon)
-    return expsato
-end
+amp0 = zeros(Float64, nray0, 2)
+p = zeros(Float64, nray0, 2)
+iddir = zeros(Int64, nlay0, nray0, 2)
+dx = zeros(Float64, nlay0, nray0, 2)
+dt = zeros(Float64, nlay0, nray0, 2)
+dtstar = zeros(Float64, nlay0, nray0, 2)
 
-# XSATO computes (4.50) from Sato and Fehler
-#   Inputs:  psi  =  spherical coor. angle (radians)
-#            zeta =  sph. coor angle from x3 (radians)
-#            nu   =  density vs. velocity pert. scaling (see 4.48)
-#            gam0 =  Pvel/Svel (often assumed = sqrt(3) )
-#   Returns: xpp, xps, xsp, xss_psi, xss_zeta  =  from eqn. (4.50)
-#
-function XSATO(psi::Float64, zeta::Float64, nu::Float64, gam0::Float64)
-    gam2::Float64 = gam0 ^ 2
-    cpsi::Float64 = cos(psi)
-    c2psi::Float64 = cos(2 * psi)
-    spsi::Float64 = sin(psi)
-    czeta::Float64 = cos(zeta)
-    szeta::Float64 = sin(zeta)
-
-    xpp::Float64 = (1. / gam2) * (nu * (-1. + cpsi + (2. / gam2) * spsi ^ 2)
-        - 2. + (4. / gam2) * spsi ^ 2)
-    xps::Float64 = -spsi * (nu * (1. - (2. / gam0) * cpsi) - (4. / gam0) * cpsi)
-    xsp::Float64 = (1. / gam2) * spsi * czeta * (nu * (1. -  (2. / gam0) * cpsi)
-        - (4. / gam0) * cpsi)
-    
-    xss_psi::Float64 = czeta * (nu * (cpsi - c2psi) - 2. * c2psi)
-    xss_zeta::Float64 = szeta * (nu * (cpsi - 1.) + 2. * cpsi)
-    return xpp, xps, xsp, xss_psi, xss_zeta
-end
-
-# GSATO computes (4.52) from Sato and Fehler (exponential autocor)
-#   Inputs:  psi  =  spherical coor. angle (radians)
-#            zeta =  sph. coor angle from x3 (radians)
-#            el   =  S-wave wavenumber (=om/beta0)
-#            nu   =  density vs. velocity pert. scaling (see 4.48)
-#            gam0 =  Pvel/Svel (often assumed = sqrt(3) )
-#            eps  =  RMS velocity perturbation
-#            a    =  correlation distance
-#   Returns: gpp,gps,gsp,gss  =  from eqn. (4.52)
-#            spol =  S-to-S scattered S polarization (radians)
-#                 =  0 for pure psi direction
-function GSATO(psi::Float64, zeta::Float64, el::Float64, nu::Float64, gam0::Float64, eps::Float64, a::Float64)
-    pi4::Float64 = 4.0 * pi
-    el4::Float64 = el ^ 4
-    gam2::Float64 = gam0 ^ 2
-
-    xpp, xps, xsp, xss_psi, xss_zeta = XSATO(psi, zeta, nu, gam0)
-
-    arg::Float64 = (2. * el / gam0) * sin(psi / 2.)
-    gpp::Float64 = (el4 / pi4) * xpp ^ 2 * EXPSATO(eps, a, arg)
-    if gpp < 1.0e-30 gpp = 0.0 end
-
-    arg = (el / gam0) * sqrt(1. + gam2 - 2. * gam0 * cos(psi))
-    gps::Float64 = (1. / gam0) * (el4 / pi4) * xps ^ 2 * EXPSATO(eps, a, arg)
-    if gps < 1.0e-30 gps = 0.0 end
-    gsp::Float64 = gam0 * (el4 / pi4) * xsp ^ 2 * EXPSATO(eps, a, arg)
-    if gsp < 1.0e-30 gsp = 0.0 end
-
-    arg = 2. * el * sin(psi / 2.)
-    gss::Float64 = (el4 / pi4) * (xss_psi ^ 2 + xss_zeta ^ 2) * EXPSATO(eps, a, arg)
-    if gss < 1.0e-30 gss = 0.0 end
-    
-    spol = atan(xss_zeta, xss_psi)
-    return gpp, gps, gsp, gss, spol
-end
-
-# GAVGSATO2 computes average over solid angle of g functions
-# in (4.52) of Sato and Fehler (exponential autocor)
-#
-# This version also does momentum scattering coef.
-#
-# Inputs:    el   =  S-wave wavenumber (=om/beta0)
-#            nu   =  density vs. velocity pert. scaling (see 4.48)
-#            gam0 =  Pvel/Svel (often assumed = sqrt(3) )
-#            eps  =  RMS velocity perturbation
-#            a    =  correlation distance
-#   Returns: gpp0,gps0,gsp0,gss0  =  averaged over solid angle
-#            gppm,gpsm,gspm,gssm  =  momentum scattering coef.
-#
-function GAVGSATO2(el::Float64, nu::Float64, gam0::Float64, eps::Float64, a::Float64)
-    n::Int64 = 60
-    pi4::Float64 = 4.0 * pi
-    el4::Float64 = el ^ 4
-    gam2::Float64 = gam0 ^ 2
-
-    sum1::Float64 = 0.0
-    sum2::Float64 = 0.0
-    sumgpp::Float64 = 0.0
-    sumgps::Float64 = 0.0
-    sumgsp::Float64 = 0.0
-    sumgss::Float64 = 0.0
-    sumgpp2::Float64 = 0.0
-    sumgps2::Float64 = 0.0
-    sumgsp2::Float64 = 0.0
-    sumgss2::Float64 = 0.0
-
-    for i in 1:n
-        psi::Float64 = float(i) * pi / float(n)
-        for j in -n:n
-            zeta::Float64 = float(j) * pi / float(n)
-            gpp, gps, gsp, gss, spol = GSATO(psi, zeta, el, nu, gam0, eps, a)
-            area::Float64 = sin(psi) * pi ^ 2 / float(n) ^ 2
-            sum1 = sum1 + area
-            sumgpp = sumgpp + gpp * area
-            sumgps = sumgps + gps * area
-            sumgsp = sumgsp + gsp * area
-            sumgss = sumgss + gss * area
-            fact::Float64 = 1.0 - cos(psi)
-            sum2 = sum2 + fact * area
-            sumgpp2 = sumgpp2 + gpp * fact * area
-            sumgps2 = sumgps2 + gps * fact * area
-            sumgsp2 = sumgsp2 + gsp * fact * area
-            sumgss2 = sumgss2 + gss * fact * area
-        end
-    end
-    # println("test one = ", sum1/pi4)
-    # println("test one (2) = ", sum2/pi4)
-    gpp0::Float64 = sumgpp / sum1
-    gps0::Float64 = sumgps / sum1
-    gsp0::Float64 = sumgsp / sum1
-    gss0::Float64 = sumgss / sum1
-    gppm::Float64 = sumgpp2 / sum2
-    gpsm::Float64 = sumgps2 / sum2
-    gspm::Float64 = sumgsp2 / sum2
-    gssm::Float64 = sumgss2 / sum2
-    return gpp0, gps0, gsp0, gss0, gppm, gpsm, gspm, gssm
-end
-
+#---------------------------------------------------------
 # read velocity model and transform to flat earth
 # value at center of earth is removed to avoid singularity
 
@@ -292,7 +164,98 @@ for iscat in 1:nscatvol
             iflagvol[i] = iscat
         end
     end
+end
 
+# -------------------- Now define interface values --------------------
+depface[1] = 0.0
+vp[1, 1] = 0.1
+vs[1, 1] = 0.01
+den[1, 1] = 0.01
+vp[1, 2] = alpha_s[1]
+vs[1, 2] = beta_s[1]
+den[1, 2] = rho[1]
+iflag[1] = 1
+
+for iface in 2:nface
+    for i = 2:npts
+        if (z_s[i] == z_s[i-1]) & (z_s[i] == depface[iface])
+            vp[iface, 1] = alpha_s[i - 1]
+            vs[iface, 1] = beta_s[i - 1]
+            den[iface, 1] = rho[i - 1]
+            vp[iface, 2] = alpha_s[i]
+            vs[iface, 2] = beta_s[i]
+            den[iface, 2] = rho[i]
+            iflag[i - 1] = iface
+            break
+            println("ERROR: interface $iface not found")
+        end
+    end
+end
+
+for iwave in 1:2
+    iw::Int64 = iwave
+    pmin::Float64 = 1.25E-05 # avoid problems with flat earth near p=0
+    
+    if iwave == 1
+        vel0::Float64 = vpsource
+        pmax = 1. / (vpmin + 0.0001)
+    else
+        vel0 = vssource
+        pmax = 1. / (vsmin + 0.0001)
+    end
+
+    dp::Float64 = (pmax - pmin) / float(np - 1)
+    p1::Float64 = pmin
+    p2::Float64 = pmin + dp
+    vel0minus::Float64 = vel0 - 0.01 # used in takeoff angle calculation
+
+    dang0::Float64 = asin(p2 * vel0minus) - asin(p1 * vel0minus)
+    for i in 1:np
+        amp0[i, iw] = 0
+        p[i, iw] = pmin + float(i - 1) * dp
+        if p[i, iw] * vel0 > 1.0 continue end
+        if i == 1
+            angcor::Float64 = 1.0
+        else
+            dang::Float64 = asin(p[i, iw] * vel0minus) - asin(p[i - 1, iw] * vel0minus)
+            angcor = dang / dang0
+        end
+        sinthe = p[i, iw] * vel0minus
+        amp0[i, iw] = sqrt(angcor * sinthe)
+    end
+
+    imth::Int64 = 3 # best for spherical earth
+    for i in 1:npts-1
+        h::Float64 = z[i+1] - z[i]
+        ilay::Int64 = i
+        for ip in 1:np
+            dx[ilay, ip, iw], dt[ilay, ip, iw], irtr = LAYERTRACE(p[ip, iw], h, slow[i, iw],
+                slow[i+1, iw], imth)
+            if irtr == -1
+                iddir[ilay, ip, iw] = 1
+            elseif irtr == 1
+                iddir[ilay, ip, iw] = 1
+            elseif irtr == 0
+                iddir[ilay, ip, iw] = -1
+            elseif irtr == 2
+                iddir[ilay, ip, iw] = -1
+                dx[ilay, ip, iw] = 2. * dx[ilay, ip, iw]
+                dt[ilay, ip, iw] = 2. * dt[ilay, ip, iw]
+            else
+                print("***ERROR: irtr = ", irtr, " ", i, " ", ilay, " ", ip, " ", p[ip, iw])
+                break
+            end
+
+            dtstar[ilay, ip, iw] = dt[ilay, ip, iw] / q[i+1, iw]
+            if iflag[i] != 0
+                iface = iflag[i]
+                r::Float64 = erad - depface[iface]
+                flatfact::Float64 = r / erad
+                pcor::Float64 = p[ip, iw] / flatfact
+            # line 668
+            end
+        end
+    end
 end
 
 # line 565
