@@ -125,8 +125,8 @@ function GAVGSATO2(el::Float64, nu::Float64, gam0::Float64, eps::Float64, a::Flo
             sumgss2 = sumgss2 + gss * fact * area
         end
     end
-    # println("test one = ", sum1/pi4)
-    # println("test one (2) = ", sum2/pi4)
+    println("test one = ", sum1/pi4)
+    println("test one (2) = ", sum2/pi4)
     gpp0::Float64 = sumgpp / sum1
     gps0::Float64 = sumgps / sum1
     gsp0::Float64 = sumgsp / sum1
